@@ -187,8 +187,6 @@ def ehessian_rows(
     num_atoms: int,
 ) -> np.ndarray:
 
-    import numpy as np
-
     # extract force pairs, stress pairs, and h pairs for each row of ehessian
     force_pairs = []
     stress_pairs = []
@@ -234,8 +232,6 @@ def compute_ehessian(
     delta_dh: float = 1e-5,
     ehessian_coordinates: str | None = None,
 ) -> np.ndarray:
-    
-    import numpy as np
     
     """See section 2.1 of the Supplementary Information:
     https://arxiv.org/abs/2602.20738
