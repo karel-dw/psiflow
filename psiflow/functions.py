@@ -248,6 +248,68 @@ class DispersionFunction(Function):
         return format_output(geometry, **self.calc.results)
 
 
+@dataclass(frozen=True)
+class ExtendedHarmonicFunction(Function):
+    positions: np.ndarray
+    cell: np.ndarray
+    ehessian: np.ndarray
+    energy: float | None = None
+    ehessian_coordinates: str | None = None
+    
+    def __post_init__(self):
+        if self.ehessian_coordinates != "dh":
+            raise NotImplementedError(
+                "Only 'dh' is supported for ehessian_coordinates, "
+                f"but got {self.ehessian_coordinates}."
+            )
+
+        n_atoms = self.positions.shape[0]
+        expected_size = 3 * n_atoms + 9
+        expected_shape = (expected_size, expected_size)
+
+        if self.ehessian.shape != expected_shape:
+            raise ValueError(
+                f"Expected ehessian to have shape {expected_shape}, "
+                f"but got {self.ehessian.shape}."
+            )
+
+        assert np.allclose(self.ehessian, self.ehessian.T), (
+            "Expected ehessian to be symmetric."
+        )
+
+        # Ensure symmetry
+        self.ehessian = 0.5 * (self.ehessian + self.ehessian.T)
+
+    def __call__(
+        self,
+        geometry: Geometry,
+    ) -> dict[str, float | np.ndarray]:
+        """See section 2.2 of the Supplementary Information:
+        https://arxiv.org/abs/2602.20738
+        """
+        # Transformation to deformed coordinates (cell unchanged)
+        transform_r_to_d = np.linalg.inv(geometry.cell) @ self.cell
+        d_d0 = geometry.per_atom.positions @ transform_r_to_d - self.positions
+        h_h0 = geometry.cell - self.cell
+        x_x0 = np.concatenate((d_d0.reshape(-1), h_h0.reshape(-1)))
+
+        # Harmonic energy and gradients in deformed and cell coordinates
+        grad_x = self.ehessian @ x_x0
+        energy = 0.5 * (x_x0 @ grad_x)
+        if self.energy is not None:
+            energy += self.energy
+        grad_d = grad_x[:-9].reshape(-1, 3)
+        grad_h = grad_x[-9:].reshape(3, 3)
+
+        # Back-transformation to Cartesian forces and stress
+        forces = (-1.0) * grad_d @ transform_r_to_d.T
+        volume = np.linalg.det(geometry.cell)
+        stress = (1 / volume) * geometry.cell.T @ grad_h
+        stress = (stress + stress.T) / 2
+
+        return {"energy": energy, "forces": forces, "stress": stress}
+
+
 def _apply(
     arg: Union[Geometry, list[Geometry], None],
     outputs_: tuple[str, ...],
@@ -282,6 +344,7 @@ def function_from_json(path: Union[str, Path], **kwargs) -> Function:
     functions = [
         EinsteinCrystalFunction,
         HarmonicFunction,
+        ExtendedHarmonicFunction,
         MACEFunction,
         PlumedFunction,
         DispersionFunction,

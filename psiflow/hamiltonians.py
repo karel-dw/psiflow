@@ -15,6 +15,7 @@ from psiflow.data import Computable, Dataset, aggregate_multiple, compute
 from psiflow.functions import (
     EinsteinCrystalFunction,
     HarmonicFunction,
+    ExtendedHarmonicFunction,
     MACEFunction,
     PlumedFunction,
     ZeroFunction,
@@ -471,6 +472,66 @@ class MACEHamiltonian(Hamiltonian):
         logger.info(f"Downloading MACE foundation model from {url}")
         _, http_msg = urllib.request.urlretrieve(url, file)
         return cls(external=file)
+
+@psiflow.register_serializable
+@dataclass
+class ExtendedHarmonicHamiltonian(Hamiltonian):
+    geometry_ref: Geometry | AppFuture[Geometry]
+    ehessian: np.ndarray | AppFuture[np.ndarray]
+    ehessian_coordinates: str | None = None
+    function_name: ClassVar[str] = "ExtendedHarmonicFunction"
+
+    def __init__(
+        self,
+        geometry_ref: Geometry | AppFuture[Geometry],
+        ehessian: np.ndarray | AppFuture[np.ndarray],
+        ehessian_coordinates: str | None = None,
+    ):
+        self.geometry_ref = geometry_ref
+        self.ehessian = ehessian
+        self.ehessian_coordinates = ehessian_coordinates
+        self._create_apps()
+
+    def _create_apps(self):
+        apply_app = python_app(_apply, executors=["default_threads"])
+        self.app = partial(
+            apply_app,
+            function_cls=ExtendedHarmonicFunction,
+            **self.parameters(),
+        )
+
+    def parameters(self) -> dict:
+        positions = get_attribute(self.geometry_ref, "per_atom", "positions")
+        cell = get_attribute(self.geometry_ref, "cell")
+        energy = get_attribute(self.geometry_ref, "energy")
+        return {
+            "positions": positions,
+            "cell": cell,
+            "ehessian": self.ehessian,
+            "energy": energy,
+            "ehessian_coordinates": self.ehessian_coordinates,
+        }
+
+    def __eq__(self, hamiltonian: Hamiltonian) -> bool:
+        if type(hamiltonian) is not ExtendedHarmonicHamiltonian:
+            return False
+        if hamiltonian.geometry_ref != self.geometry_ref:
+            return False
+
+        # slightly different check for numpy arrays
+        is_array0 = type(hamiltonian.ehessian) is np.ndarray
+        is_array1 = type(self.ehessian) is np.ndarray
+        if is_array0 and is_array1:
+            equal = np.allclose(
+                hamiltonian.ehessian,
+                self.ehessian,
+            )
+        else:
+            equal = hamiltonian.ehessian == self.ehessian
+
+        if not equal:
+            return False
+        return True
 
 
 def combine_hamiltonians(hamiltonians: list[Hamiltonian]) -> MixtureHamiltonian:
