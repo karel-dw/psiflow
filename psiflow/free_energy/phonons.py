@@ -4,13 +4,13 @@ from typing import Optional, Union
 import numpy as np
 import parsl
 from ase.units import Bohr, Ha, J, _c, _hplanck, _k, kB, second
-from parsl.app.app import bash_app, python_app
+from parsl.app.app import bash_app, python_app, join_app
 from parsl.dataflow.futures import AppFuture
 
 import psiflow
 from psiflow.data import Dataset
 from psiflow.geometry import Geometry, mass_weight
-from psiflow.hamiltonians import Hamiltonian, MACEHamiltonian
+from psiflow.hamiltonians import Hamiltonian, MACEHamiltonian, MixtureHamiltonian
 from psiflow.sampling.sampling import (
     setup_sockets,
     make_server_command,
@@ -175,3 +175,152 @@ def compute_harmonic(
         parsl_resource_specification=definition.wq_resources(1),
     )
     return multiply(load_numpy(inputs=[result.outputs[0]]), Ha / Bohr**2)
+
+
+@python_app
+def ehessian_rows(
+    forces: AppFuture | list[np.ndarray],
+    stresses: AppFuture | list[np.ndarray],
+    pert_geos: list[Geometry],
+    h_ref: np.ndarray,
+    delta_dh: float,
+    num_atoms: int,
+) -> np.ndarray:
+
+    import numpy as np
+
+    # extract force pairs, stress pairs, and h pairs for each row of ehessian
+    force_pairs = []
+    stress_pairs = []
+    h_pairs = []
+    for i in range(0, len(forces), 2):
+        force_pairs.append((forces[i], forces[i + 1]))
+        stress_pairs.append((stresses[i], stresses[i + 1]))
+        h_pairs.append((pert_geos[i].cell, pert_geos[i + 1].cell))
+
+    # compute rows of ehessian
+    rows = []
+    
+    for force_pair, stress_pair, h_pair in zip(
+        force_pairs, stress_pairs, h_pairs):
+
+        row = np.zeros(3 * num_atoms + 9)
+
+        # compute first 3N elements of row
+        dE_dd_pair = []
+        for force, h in zip(force_pair, h_pair):
+            dE_dr = (-1.0) * force
+            dE_dd = dE_dr @ (np.linalg.inv(h_ref) @ h).T
+            dE_dd_pair.append(dE_dd)
+        row[:3 * num_atoms] = ((dE_dd_pair[0] - dE_dd_pair[1]) / (2 * delta_dh)).flatten()
+        
+        # compute last 9 elements of row
+        dE_dh_pair = []
+        for stress, h in zip(stress_pair, h_pair):
+            volume = np.linalg.det(h)
+            dE_dh = volume * (stress @ np.linalg.inv(h)).T
+            dE_dh_pair.append(dE_dh)
+        row[3 * num_atoms:] = ((dE_dh_pair[0] - dE_dh_pair[1]) / (2 * delta_dh)).flatten()
+
+        rows.append(row)
+    
+    return np.array(rows)
+
+
+@join_app
+def compute_ehessian(
+    geometry_ref: Geometry,
+    hamiltonian: Hamiltonian,
+    delta_dh: float = 1e-5,
+    ehessian_coordinates: str | None = None,
+) -> np.ndarray:
+    
+    import numpy as np
+    
+    """See section 2.1 of the Supplementary Information:
+    https://arxiv.org/abs/2602.20738
+
+    Compute the extended Hessian (ehessian) of a given potential energy
+    surface around a given reference geometry.
+
+    Generates finite-difference perturbations of atomic positions and cell
+    degrees of freedom, evaluates forces and stresses, and assembles the 
+    ehessian matrix.
+
+    Args:
+        geometry_ref: Reference Geometry object.
+        hamiltonian: Hamiltonian used to compute energies, forces, and stresses.
+        delta_dh: Finite difference step size [Angstrom].
+        ehessian_coordinates: Coordinate type for ehessian ("dh" supported).
+        check_ehessian: If True, verify and enforce symmetry of ehessian.
+
+    Returns:
+        np.ndarray: ehessian matrix of shape (3N + 9, 3N + 9).
+
+    Raises:
+        NotImplementedError: If unsupported ehessian_coordinates are requested.
+    """
+
+    # if isinstance(hamiltonian, MixtureHamiltonian):
+    #    for h in hamiltonian.hamiltonians:
+    #        if isinstance(h, MACEHamiltonian) and h.dtype != "float64":
+    #            print(
+    #                f"Warning: MACEhamiltonian dtype is {h.dtype}, and is set to "
+    #                "float64, which is required for accurate ehessian calculation"
+    #            )
+    #            h.dtype = "float64"
+    # elif isinstance(hamiltonian, MACEHamiltonian) and hamiltonian.dtype != "float64":
+    #    print(
+    #        f"Warning: MACEhamiltonian dtype is {hamiltonian.dtype}, and is set to "
+    #        "float64, which is required for accurate ehessian calculation"
+    #    )
+    #    hamiltonian.dtype = "float64"
+    
+    if ehessian_coordinates != "dh":
+        raise NotImplementedError(
+            "Only 'dh' is supported for ehessian_coordinates, "
+            f"but got {ehessian_coordinates}."
+        )
+    
+    num_atoms = len(geometry_ref)
+    h_ref = np.copy(geometry_ref.cell)
+    d_ref = np.copy(geometry_ref.per_atom.positions)
+
+    ## compute oppositely perturbed geometry pairs
+    ## for each deformed atomic coordinate and for each cell coordinate
+    pert_geos = []
+
+    # compute first 3N x 2 perturbed geometries (for first 3N rows of ehessian)
+    for i in range(num_atoms):
+        for j in range(3):
+            for direction in (+1, -1):
+                d_pert = np.copy(d_ref)
+                d_pert[i, j] += direction * delta_dh
+
+                tmp_geo = geometry_ref.copy()
+                tmp_geo.per_atom.positions = d_pert
+
+                pert_geos.append(tmp_geo)
+
+    # compute last 9 x 2 perturbed geometries (for last 9 rows of ehessian)
+    for i in range(3):
+        for j in range(3):
+            for direction in (+1, -1):
+                h_pert = np.copy(h_ref)
+                h_pert[i, j] += direction * delta_dh
+                d_pert = np.copy(d_ref) @ np.linalg.inv(h_ref) @ h_pert
+
+                tmp_geo = geometry_ref.copy()
+                tmp_geo.per_atom.positions = d_pert
+                tmp_geo.cell = h_pert
+
+                pert_geos.append(tmp_geo)
+
+    ## compute forces and stresses via a single .compute call for all 2 x (3N + 9)
+    ## perturbed geometries
+    _energies, forces, stresses = hamiltonian.compute(pert_geos)
+
+    ## compute (3N + 9) rows of ehessian
+    ehessian = ehessian_rows(forces, stresses, pert_geos, h_ref, delta_dh, num_atoms)
+
+    return ehessian
